@@ -22,14 +22,28 @@ long baud = 9600;
 bool apMode = false;
 int lastWiFiStatus = -1; // para detectar mudanças de estado
 
-// Buffers para leitura serial
-String serialBuffer = "";
-unsigned long lastSerialDataTime = 0;
-const int serialReadTimeout = 50; // ms
+// Variáveis de controle
+String lineEnding = "\r\n"; // Padrão CR+LF
 
-String mySerialBuffer = "";
-unsigned long lastMySerialDataTime = 0;
-const int mySerialReadTimeout = 50; // ms
+// Constantes para o buffer circular
+const int BUFFER_SIZE = 4096;
+const int READ_CHUNK_SIZE = 64;
+
+// Buffers circulares
+uint8_t hwSerialBuffer[BUFFER_SIZE];
+uint8_t swSerialBuffer[BUFFER_SIZE];
+int hwSerialHead = 0;
+int hwSerialTail = 0;
+int swSerialHead = 0;
+int swSerialTail = 0;
+
+// Timeouts
+int serialReadTimeout = 1; // ms (tempo mínimo entre leituras)
+int mySerialReadTimeout = 1; // ms
+
+// Timestamps para controle
+unsigned long lastSerialRead = 0;
+unsigned long lastMySerialRead = 0;
 
 // Servidor HTTP e WebSocket
 ESP8266WebServer server(80);
@@ -256,6 +270,13 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                 <option value="57600">57600 baud</option>
                 <option value="115200">115200 baud</option>
             </select>
+            <select id="lineEnding" onchange="changeLineEnding()" class="baudrate-select">
+                <option value="CRLF" selected>CR+LF (\r\n)</option>
+                <option value="CR">CR (\r)</option>
+                <option value="LF">LF (\n)</option>
+                <option value="NONE">Nenhum</option>
+            </select>
+            <input type="number" id="bufferTimeout" value="50" min="10" max="500" step="10" onchange="changeBufferTimeout()" class="baudrate-select" style="width: 80px;" title="Buffer Timeout (ms)">
             <div class="view-controls">
                 <button onclick="toggleHexView()" class="control-button" id="hexButton">HEX</button>
                 <button onclick="toggleAutoscroll()" class="control-button" id="scrollButton">Auto-scroll</button>
@@ -325,6 +346,18 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             const baudrate = document.getElementById('baudrate').value;
             websocket.send(`@BAUD=${baudrate}`);
             addToTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
+        }
+
+        function changeLineEnding() {
+            const ending = document.getElementById('lineEnding').value;
+            websocket.send(`@ENDING=${ending}`);
+            addToTerminal(`Final de linha alterado para ${ending}`, 'system');
+        }
+
+        function changeBufferTimeout() {
+            const timeout = document.getElementById('bufferTimeout').value;
+            websocket.send(`@TIMEOUT=${timeout}`);
+            addToTerminal(`Timeout do buffer alterado para ${timeout}ms`, 'system');
         }
 
         window.addEventListener('load', onLoad);
@@ -674,13 +707,15 @@ void connectToWiFiOrAP(unsigned long timeout_ms = 10000) {
 void setup() {
   // Inicializa Serial com buffer maior e parâmetros específicos
   Serial.begin(115200, SERIAL_8N1);
-  Serial.setRxBufferSize(512);
+  Serial.setRxBufferSize(4096); // Buffer ainda maior
+  Serial.setTimeout(1); // Timeout mínimo para leitura mais rápida
   Serial.flush();
   delay(100);
   Serial.println("Debug serial OK");
   
   // Serial extra com buffer maior e parâmetros específicos
   mySerial.begin(baud);
+  mySerial.setTimeout(1); // Timeout mínimo para leitura mais rápida
   mySerial.flush();
   delay(100);
   mySerial.println("Serial extra OK");
@@ -746,35 +781,79 @@ void loop() {
   }
 
   // Handle Hardware Serial
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    serialBuffer += c;
-    lastSerialDataTime = millis();
-    if (c == '\n') {
-      webSocket.broadcastTXT(serialBuffer);
-      serialBuffer = "";
+  if (millis() - lastSerialRead >= serialReadTimeout) {
+    while (Serial.available()) {
+      // Lê em chunks pequenos para evitar bloqueio
+      int bytesToRead = min(Serial.available(), READ_CHUNK_SIZE);
+      for (int i = 0; i < bytesToRead; i++) {
+        hwSerialBuffer[hwSerialHead] = Serial.read();
+        hwSerialHead = (hwSerialHead + 1) % BUFFER_SIZE;
+        
+        // Se o buffer está cheio, envia o que tiver
+        if (hwSerialHead == hwSerialTail) {
+          String data = "";
+          while (hwSerialTail != hwSerialHead) {
+            data += (char)hwSerialBuffer[hwSerialTail];
+            hwSerialTail = (hwSerialTail + 1) % BUFFER_SIZE;
+          }
+          if (data.length() > 0) {
+            webSocket.broadcastTXT(data);
+          }
+        }
+      }
+      yield();
     }
-  }
-  // Send remaining data after a timeout
-  if (serialBuffer.length() > 0 && (millis() - lastSerialDataTime > serialReadTimeout)) {
-    webSocket.broadcastTXT(serialBuffer);
-    serialBuffer = "";
+    
+    // Se há dados no buffer, envia
+    if (hwSerialHead != hwSerialTail) {
+      String data = "";
+      while (hwSerialTail != hwSerialHead) {
+        data += (char)hwSerialBuffer[hwSerialTail];
+        hwSerialTail = (hwSerialTail + 1) % BUFFER_SIZE;
+      }
+      if (data.length() > 0) {
+        webSocket.broadcastTXT(data);
+      }
+    }
+    lastSerialRead = millis();
   }
 
   // Handle Software Serial
-  while (mySerial.available() > 0) {
-    char c = mySerial.read();
-    mySerialBuffer += c;
-    lastMySerialDataTime = millis();
-    if (c == '\n') {
-      webSocket.broadcastTXT(mySerialBuffer);
-      mySerialBuffer = "";
+  if (millis() - lastMySerialRead >= mySerialReadTimeout) {
+    while (mySerial.available()) {
+      // Lê em chunks pequenos para evitar bloqueio
+      int bytesToRead = min(mySerial.available(), READ_CHUNK_SIZE);
+      for (int i = 0; i < bytesToRead; i++) {
+        swSerialBuffer[swSerialHead] = mySerial.read();
+        swSerialHead = (swSerialHead + 1) % BUFFER_SIZE;
+        
+        // Se o buffer está cheio, envia o que tiver
+        if (swSerialHead == swSerialTail) {
+          String data = "";
+          while (swSerialTail != swSerialHead) {
+            data += (char)swSerialBuffer[swSerialTail];
+            swSerialTail = (swSerialTail + 1) % BUFFER_SIZE;
+          }
+          if (data.length() > 0) {
+            webSocket.broadcastTXT(data);
+          }
+        }
+      }
+      yield();
     }
-  }
-  // Send remaining data after a timeout
-  if (mySerialBuffer.length() > 0 && (millis() - lastMySerialDataTime > mySerialReadTimeout)) {
-    webSocket.broadcastTXT(mySerialBuffer);
-    mySerialBuffer = "";
+    
+    // Se há dados no buffer, envia
+    if (swSerialHead != swSerialTail) {
+      String data = "";
+      while (swSerialTail != swSerialHead) {
+        data += (char)swSerialBuffer[swSerialTail];
+        swSerialTail = (swSerialTail + 1) % BUFFER_SIZE;
+      }
+      if (data.length() > 0) {
+        webSocket.broadcastTXT(data);
+      }
+    }
+    lastMySerialRead = millis();
   }
 }
 
@@ -801,6 +880,26 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         webSocket.broadcastTXT(response);
       }
     }
+    // Muda final de linha
+    else if (msg.startsWith("@ENDING=")) {
+      String newEnding = msg.substring(8);
+      if (newEnding == "CRLF") lineEnding = "\r\n";
+      else if (newEnding == "CR") lineEnding = "\r";
+      else if (newEnding == "LF") lineEnding = "\n";
+      else if (newEnding == "NONE") lineEnding = "";
+      String response = "Final de linha alterado para: " + newEnding;
+      webSocket.sendTXT(num, response);
+    }
+    // Muda timeout do buffer
+    else if (msg.startsWith("@TIMEOUT=")) {
+      int newTimeout = msg.substring(9).toInt();
+      if (newTimeout >= 10 && newTimeout <= 500) {
+        serialReadTimeout = newTimeout;
+        mySerialReadTimeout = newTimeout;
+        String response = "Timeout do buffer alterado para: " + String(newTimeout) + "ms";
+        webSocket.sendTXT(num, response);
+      }
+    }
     // Simula dump de firmware
     else if (msg.startsWith("@DUMP=")) {
       int sep = msg.indexOf(',');
@@ -819,8 +918,8 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     }
     // Comando normal: envia para ambas UARTs
     else {
-      Serial.print(msg);
-      mySerial.print(msg);
+      Serial.print(msg + lineEnding);
+      mySerial.print(msg + lineEnding);
     }
   }
 }
