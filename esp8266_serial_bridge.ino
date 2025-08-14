@@ -26,6 +26,13 @@ bool serialActive = false;
 bool apMode = false;
 int lastWiFiStatus = -1; // para detectar mudanças de estado
 
+// Configurações persistentes
+struct {
+    long baudrate = 9600;
+    String lineEnding = "\r\n";
+    int bufferTimeout = 50;
+} currentConfig;
+
 // Variáveis de controle
 String lineEnding = "\r\n"; // Padrão CR+LF
 
@@ -77,8 +84,21 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             gap: 20px;
             height: 400px;
         }
-        .terminal-container {
+        .terminals-container {
+            display: flex;
+            gap: 20px;
             flex: 2;
+        }
+        .terminal-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        .terminal-header {
+            background: #333;
+            padding: 5px 10px;
+            border-radius: 5px 5px 0 0;
+            margin-bottom: 5px;
         }
         .history-container {
             flex: 1;
@@ -129,7 +149,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             font-size: 0.8em;
             margin-right: 5px;
         }
-        #terminal { 
+        .terminal { 
             background: #000; 
             padding: 10px; 
             height: 400px; 
@@ -324,11 +344,18 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         </div>
     </div>
     <div class="main-container">
-        <div class="terminal-container">
-            <div id="terminal"></div>
-            <div class="input-area">
-                <input type="text" id="commandInput" placeholder="Digite um comando...">
-                <button onclick="sendCommand()">Enviar</button>
+        <div class="terminals-container">
+            <div class="terminal-container">
+                <div class="terminal-header">Terminal de Envio</div>
+                <div id="terminal" class="terminal"></div>
+                <div class="input-area">
+                    <input type="text" id="commandInput" placeholder="Digite um comando...">
+                    <button onclick="sendCommand()">Enviar</button>
+                </div>
+            </div>
+            <div class="terminal-container">
+                <div class="terminal-header">Terminal de Retorno</div>
+                <div id="terminalEcho" class="terminal"></div>
             </div>
         </div>
         <div class="history-container">
@@ -365,6 +392,21 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             totalBytesReceived: 0
         };
         
+        function addToSendTerminal(message, type) {
+            const line = createTerminalLine(message, type);
+            const fragment = document.createDocumentFragment();
+            fragment.appendChild(line);
+            domElements.terminal.appendChild(fragment);
+            
+            if (state.autoScroll) {
+                domElements.terminal.scrollTop = domElements.terminal.scrollHeight;
+            }
+            
+            while (domElements.terminal.children.length > CONFIG.maxTerminalMessages) {
+                domElements.terminal.removeChild(domElements.terminal.firstChild);
+            }
+        }
+
         function changeBaudRate() {
             const baudrateSelect = document.getElementById('baudrate');
             const customBaudrateInput = document.getElementById('customBaudrate');
@@ -378,8 +420,15 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             }
             
             const baudrate = baudrateSelect.value;
-            websocket.send(`@BAUD=${baudrate}`);
-            addToTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
+            // Armazena a configuração localmente
+            localStorage.setItem('lastBaudrate', baudrate);
+            
+            // Tenta enviar se houver conexão
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send(`@BAUD=${baudrate}`);
+            }
+            
+            addToSendTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
         }
 
         // Função para lidar com baudrate personalizado
@@ -388,10 +437,16 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             customBaudrateInput.addEventListener('change', function() {
                 const baudrate = this.value;
                 if (baudrate >= 1200 && baudrate <= 2000000) {
-                    websocket.send(`@BAUD=${baudrate}`);
-                    addToTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
+                    // Armazena a configuração localmente
+                    localStorage.setItem('lastBaudrate', baudrate);
+                    
+                    // Tenta enviar se houver conexão
+                    if (websocket && websocket.readyState === WebSocket.OPEN) {
+                        websocket.send(`@BAUD=${baudrate}`);
+                    }
+                    addToSendTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
                 } else {
-                    addToTerminal('Baudrate inválido. Use valores entre 1200 e 2000000', 'system');
+                    addToSendTerminal('Baudrate inválido. Use valores entre 1200 e 2000000', 'system');
                 }
             });
         });
@@ -405,7 +460,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         function changeBufferTimeout() {
             const timeout = document.getElementById('bufferTimeout').value;
             websocket.send(`@TIMEOUT=${timeout}`);
-            addToTerminal(`Timeout do buffer alterado para ${timeout}ms`, 'system');
+            addToSendTerminal(`Timeout do buffer alterado para ${timeout}ms`, 'system');
         }
 
         window.addEventListener('load', onLoad);
@@ -414,6 +469,19 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             initDOMCache();
             initWebSocket();
             startStatistics();
+            
+            // Carrega o último baud rate salvo
+            const lastBaudrate = localStorage.getItem('lastBaudrate');
+            if (lastBaudrate) {
+                const baudrateSelect = document.getElementById('baudrate');
+                if (Array.from(baudrateSelect.options).some(opt => opt.value === lastBaudrate)) {
+                    baudrateSelect.value = lastBaudrate;
+                } else {
+                    baudrateSelect.value = 'custom';
+                    document.getElementById('customBaudrate').value = lastBaudrate;
+                    document.getElementById('customBaudrate').style.display = 'inline-block';
+                }
+            }
             
             document.getElementById('commandInput').addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
@@ -458,8 +526,52 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             }
         }
 
+        function handleConfig(message) {
+            const [cmd, value] = message.split('=');
+            switch(cmd) {
+                case '@CONFIG:BAUD':
+                    document.getElementById('baudrate').value = value;
+                    if (!document.getElementById('baudrate').value) {
+                        document.getElementById('baudrate').value = 'custom';
+                        document.getElementById('customBaudrate').value = value;
+                        document.getElementById('customBaudrate').style.display = 'inline-block';
+                    }
+                    break;
+                case '@CONFIG:ENDING':
+                    document.getElementById('lineEnding').value = value;
+                    break;
+                case '@CONFIG:TIMEOUT':
+                    document.getElementById('bufferTimeout').value = value;
+                    break;
+            }
+        }
+
         function onMessage(event) {
-            addToTerminal(event.data, 'received');
+            // Verifica se é uma mensagem de configuração
+            if (event.data.startsWith('@CONFIG:')) {
+                handleConfig(event.data);
+                return;
+            }
+            
+            // Atualiza estatísticas
+            updateStats(event.data);
+            
+            // Adiciona ao terminal de eco (retorno)
+            const line = createTerminalLine(event.data, 'received');
+            const fragment = document.createDocumentFragment();
+            fragment.appendChild(line);
+            domElements.terminalEcho.appendChild(fragment);
+            
+            // Auto-scroll para o terminal de eco
+            if (state.autoScroll) {
+                domElements.terminalEcho.scrollTop = domElements.terminalEcho.scrollHeight;
+            }
+            
+            // Limita o número de mensagens no terminal de eco
+            while (domElements.terminalEcho.children.length > CONFIG.maxTerminalMessages) {
+                domElements.terminalEcho.removeChild(domElements.terminalEcho.firstChild);
+            }
+            
             addToHistory(event.data);
         }
 
@@ -502,9 +614,23 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                 // Permite enviar comandos independente do estado da conexão
                 try {
                     websocket.send(cmd);
-                    addToTerminal('> ' + cmd, 'sent');
+                    const line = createTerminalLine('> ' + cmd, 'sent');
+                    const fragment = document.createDocumentFragment();
+                    fragment.appendChild(line);
+                    domElements.terminal.appendChild(fragment);
+                    
+                    if (state.autoScroll) {
+                        domElements.terminal.scrollTop = domElements.terminal.scrollHeight;
+                    }
+                    
+                    while (domElements.terminal.children.length > CONFIG.maxTerminalMessages) {
+                        domElements.terminal.removeChild(domElements.terminal.firstChild);
+                    }
                 } catch (e) {
-                    addToTerminal('Erro ao enviar comando: ' + e, 'system');
+                    const line = createTerminalLine('Erro ao enviar comando: ' + e, 'system');
+                    const fragment = document.createDocumentFragment();
+                    fragment.appendChild(line);
+                    domElements.terminal.appendChild(fragment);
                 }
                 document.getElementById('commandInput').value = '';
             }
@@ -512,6 +638,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
 
         const domElements = {
             terminal: null,
+            terminalEcho: null,
             bytesReceived: null,
             lastMessageTime: null,
             messagesPerSecond: null,
@@ -521,6 +648,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
 
         function initDOMCache() {
             domElements.terminal = document.getElementById('terminal');
+            domElements.terminalEcho = document.getElementById('terminalEcho');
             domElements.bytesReceived = document.getElementById('bytesReceived');
             domElements.lastMessageTime = document.getElementById('lastMessageTime');
             domElements.messagesPerSecond = document.getElementById('messagesPerSecond');
@@ -539,14 +667,23 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             state.isHexView = !state.isHexView;
             document.getElementById('hexButton').classList.toggle('active');
             
-            const fragment = document.createDocumentFragment();
+            // Atualiza terminal de envio
+            const fragmentSend = document.createDocumentFragment();
             Array.from(domElements.terminal.children).forEach(msg => {
                 const newLine = createTerminalLine(msg.textContent, msg.className);
-                fragment.appendChild(newLine);
+                fragmentSend.appendChild(newLine);
             });
-            
             domElements.terminal.innerHTML = '';
-            domElements.terminal.appendChild(fragment);
+            domElements.terminal.appendChild(fragmentSend);
+            
+            // Atualiza terminal de retorno
+            const fragmentEcho = document.createDocumentFragment();
+            Array.from(domElements.terminalEcho.children).forEach(msg => {
+                const newLine = createTerminalLine(msg.textContent, msg.className);
+                fragmentEcho.appendChild(newLine);
+            });
+            domElements.terminalEcho.innerHTML = '';
+            domElements.terminalEcho.appendChild(fragmentEcho);
         }
 
         function toggleAutoscroll() {
@@ -577,7 +714,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
 
         function startFirmwareDump() {
             if (isDumping) {
-                addToTerminal('Dump já em andamento...', 'system');
+                addToSendTerminal('Dump já em andamento...', 'system');
                 return;
             }
 
@@ -588,7 +725,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             dumpStartAddress = 0;
             totalBytesReceived = 0;
 
-            addToTerminal('Iniciando dump do firmware...', 'system');
+            addToSendTerminal('Iniciando dump do firmware...', 'system');
             requestNextChunk();
         }
 
@@ -679,27 +816,13 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             return line;
         }
 
-        function addToTerminal(message, type) {
-            // Usa a mensagem diretamente sem tentar decodificar
-            let cleanMsg = message;
-            state.bytesReceived += cleanMsg.length;
-            state.totalBytesReceived += cleanMsg.length;
+        function updateStats(message) {
+            state.bytesReceived += message.length;
+            state.totalBytesReceived += message.length;
             state.lastMessageTime = new Date();
-            if (type === 'received') {
-                state.messagesLastSecond++;
-                domElements.bytesReceived.textContent = state.bytesReceived;
-                domElements.lastMessageTime.textContent = state.lastMessageTime.toLocaleTimeString();
-            }
-            const line = createTerminalLine(cleanMsg, type);
-            const fragment = document.createDocumentFragment();
-            fragment.appendChild(line);
-            domElements.terminal.appendChild(fragment);
-            if (state.autoScroll) {
-                domElements.terminal.scrollTop = domElements.terminal.scrollHeight;
-            }
-            while (domElements.terminal.children.length > CONFIG.maxTerminalMessages) {
-                domElements.terminal.removeChild(domElements.terminal.firstChild);
-            }
+            state.messagesLastSecond++;
+            domElements.bytesReceived.textContent = state.bytesReceived;
+            domElements.lastMessageTime.textContent = state.lastMessageTime.toLocaleTimeString();
         }
     </script>
 </body>
@@ -858,7 +981,7 @@ void loop() {
             hwSerialTail = (hwSerialTail + 1) % BUFFER_SIZE;
           }
           if (data.length() > 0) {
-            webSocket.broadcastTXT(data);
+            sendFormattedData(data, "HW->USB");
           }
         }
       }
@@ -873,7 +996,7 @@ void loop() {
         hwSerialTail = (hwSerialTail + 1) % BUFFER_SIZE;
       }
       if (data.length() > 0) {
-        webSocket.broadcastTXT(data);
+        sendFormattedData(data, "HW->USB");
       }
     }
     lastSerialRead = millis();
@@ -896,7 +1019,7 @@ void loop() {
             swSerialTail = (swSerialTail + 1) % BUFFER_SIZE;
           }
           if (data.length() > 0) {
-            webSocket.broadcastTXT(data);
+            sendFormattedData(data, "TX/RX");
           }
         }
       }
@@ -911,22 +1034,52 @@ void loop() {
         swSerialTail = (swSerialTail + 1) % BUFFER_SIZE;
       }
       if (data.length() > 0) {
-        webSocket.broadcastTXT(data);
+        sendFormattedData(data, "TX/RX");
       }
     }
     lastMySerialRead = millis();
   }
 }
 
+// Função para enviar dados formatados para o WebSocket
+void sendFormattedData(const String& data, const String& source) {
+    String formattedData = "[" + source + "] " + data;
+    webSocket.broadcastTXT(formattedData);
+}
+
+// Função para enviar configurações atuais para um cliente
+void sendCurrentConfig(uint8_t clientNum) {
+    // Envia baudrate atual
+    String baudConfig = "@CONFIG:BAUD=" + String(currentConfig.baudrate);
+    webSocket.sendTXT(clientNum, baudConfig);
+    
+    // Envia configuração de line ending
+    String endingConfig = "@CONFIG:ENDING=";
+    if (currentConfig.lineEnding == "\r\n") endingConfig += "CRLF";
+    else if (currentConfig.lineEnding == "\r") endingConfig += "CR";
+    else if (currentConfig.lineEnding == "\n") endingConfig += "LF";
+    else endingConfig += "NONE";
+    webSocket.sendTXT(clientNum, endingConfig);
+    
+    // Envia timeout do buffer
+    String timeoutConfig = "@CONFIG:TIMEOUT=" + String(currentConfig.bufferTimeout);
+    webSocket.sendTXT(clientNum, timeoutConfig);
+}
+
 // WebSocket <-> UART e comandos especiais
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  if (type == WStype_TEXT) {
+  if (type == WStype_CONNECTED) {
+    // Cliente conectado - envia configurações atuais
+    sendCurrentConfig(num);
+  }
+  else if (type == WStype_TEXT) {
     String msg = String((char*)payload);
 
     // Muda baudrate
     if (msg.startsWith("@BAUD=")) {
       long newBaud = msg.substring(6).toInt();
       if (newBaud > 0) {
+        currentConfig.baudrate = newBaud;
         baud = newBaud;
         // Configura ambas as seriais
         Serial.flush();
@@ -950,10 +1103,11 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     // Muda final de linha
     else if (msg.startsWith("@ENDING=")) {
       String newEnding = msg.substring(8);
-      if (newEnding == "CRLF") lineEnding = "\r\n";
-      else if (newEnding == "CR") lineEnding = "\r";
-      else if (newEnding == "LF") lineEnding = "\n";
-      else if (newEnding == "NONE") lineEnding = "";
+      if (newEnding == "CRLF") currentConfig.lineEnding = "\r\n";
+      else if (newEnding == "CR") currentConfig.lineEnding = "\r";
+      else if (newEnding == "LF") currentConfig.lineEnding = "\n";
+      else if (newEnding == "NONE") currentConfig.lineEnding = "";
+      lineEnding = currentConfig.lineEnding;
       String response = "Final de linha alterado para: " + newEnding;
       webSocket.sendTXT(num, response);
     }
@@ -961,6 +1115,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     else if (msg.startsWith("@TIMEOUT=")) {
       int newTimeout = msg.substring(9).toInt();
       if (newTimeout >= 10 && newTimeout <= 500) {
+        currentConfig.bufferTimeout = newTimeout;
         serialReadTimeout = newTimeout;
         mySerialReadTimeout = newTimeout;
         String response = "Timeout do buffer alterado para: " + String(newTimeout) + "ms";
@@ -985,7 +1140,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     }
     // Comando normal: envia para ambas UARTs
     else {
+      sendFormattedData(msg, "WEB->USB");  // Indica que o comando veio da web para a USB
       Serial.print(msg + lineEnding);
+      
+      sendFormattedData(msg, "WEB->TX/RX");  // Indica que o comando veio da web para TX/RX
       mySerial.print(msg + lineEnding);
     }
   }
