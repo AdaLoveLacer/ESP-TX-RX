@@ -11,14 +11,18 @@ const char* sta_password = "neves@725";
 const char* ap_ssid = "ESP8266-Serial";
 const char* ap_password = "12345678";
 
-// Pinos UART (D7=GPIO13, D8=GPIO15)
-#define RX_PIN 4
-#define TX_PIN 5
+// Pinos UART
+#define RX_PIN 4  // GPIO4 (D2)
+#define TX_PIN 5  // GPIO5 (D1)
 
-SoftwareSerial mySerial(RX_PIN, TX_PIN); // RX, TX
+// Configurações da Serial por Software
+SoftwareSerial mySerial(RX_PIN, TX_PIN, false);  // RX, TX, inverse_logic
 
 // Baudrate inicial
 long baud = 9600;
+
+// Flags de controle
+bool serialActive = false;
 bool apMode = false;
 int lastWiFiStatus = -1; // para detectar mudanças de estado
 
@@ -201,12 +205,26 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             border-radius: 3px;
             cursor: pointer;
             font-size: 0.9em;
+            margin-right: 5px;
         }
         .baudrate-select:hover {
             background: #555;
         }
         .baudrate-select option {
             background: #333;
+        }
+        #customBaudrate {
+            width: 100px;
+            background: #444;
+            color: #fff;
+            border: 1px solid #555;
+            border-radius: 3px;
+            padding: 4px 8px;
+            font-size: 0.9em;
+        }
+        #customBaudrate:focus {
+            outline: none;
+            border-color: #0066cc;
         }
         .view-controls {
             display: flex;
@@ -269,7 +287,12 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                 <option value="38400">38400 baud</option>
                 <option value="57600">57600 baud</option>
                 <option value="115200">115200 baud</option>
+                <option value="230400">230400 baud</option>
+                <option value="460800">460800 baud</option>
+                <option value="921600">921600 baud</option>
+                <option value="custom">Personalizado...</option>
             </select>
+            <input type="number" id="customBaudrate" style="display: none;" class="baudrate-select" min="1200" max="2000000" step="1200" placeholder="Baudrate...">
             <select id="lineEnding" onchange="changeLineEnding()" class="baudrate-select">
                 <option value="CRLF" selected>CR+LF (\r\n)</option>
                 <option value="CR">CR (\r)</option>
@@ -343,10 +366,35 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         };
         
         function changeBaudRate() {
-            const baudrate = document.getElementById('baudrate').value;
+            const baudrateSelect = document.getElementById('baudrate');
+            const customBaudrateInput = document.getElementById('customBaudrate');
+            
+            if (baudrateSelect.value === 'custom') {
+                customBaudrateInput.style.display = 'inline-block';
+                customBaudrateInput.focus();
+                return;
+            } else {
+                customBaudrateInput.style.display = 'none';
+            }
+            
+            const baudrate = baudrateSelect.value;
             websocket.send(`@BAUD=${baudrate}`);
             addToTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
         }
+
+        // Função para lidar com baudrate personalizado
+        document.addEventListener('DOMContentLoaded', function() {
+            const customBaudrateInput = document.getElementById('customBaudrate');
+            customBaudrateInput.addEventListener('change', function() {
+                const baudrate = this.value;
+                if (baudrate >= 1200 && baudrate <= 2000000) {
+                    websocket.send(`@BAUD=${baudrate}`);
+                    addToTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
+                } else {
+                    addToTerminal('Baudrate inválido. Use valores entre 1200 e 2000000', 'system');
+                }
+            });
+        });
 
         function changeLineEnding() {
             const ending = document.getElementById('lineEnding').value;
@@ -705,20 +753,33 @@ void connectToWiFiOrAP(unsigned long timeout_ms = 10000) {
 }
 
 void setup() {
+  // Configuração dos pinos
+  pinMode(TX_PIN, OUTPUT);
+  pinMode(RX_PIN, INPUT);
+  
+  // Pull-down via software no TX
+  digitalWrite(TX_PIN, LOW);
+  digitalWrite(RX_PIN, LOW);
+  delay(100);
+  
   // Inicializa Serial com buffer maior e parâmetros específicos
   Serial.begin(115200, SERIAL_8N1);
-  Serial.setRxBufferSize(4096); // Buffer ainda maior
-  Serial.setTimeout(1); // Timeout mínimo para leitura mais rápida
+  Serial.setRxBufferSize(4096);
+  Serial.setTimeout(1);
   Serial.flush();
   delay(100);
   Serial.println("Debug serial OK");
   
-  // Serial extra com buffer maior e parâmetros específicos
+  // Configura e inicia a Serial por Software
   mySerial.begin(baud);
-  mySerial.setTimeout(1); // Timeout mínimo para leitura mais rápida
   mySerial.flush();
+  mySerial.setTimeout(1);
+  
+  // Testa a comunicação
   delay(100);
+  serialActive = true;
   mySerial.println("Serial extra OK");
+  Serial.println("Serial extra iniciada");
 
   // tenta conectar; se falhar, habilita AP automaticamente
   connectToWiFiOrAP(10000); // timeout em ms
@@ -871,10 +932,16 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         Serial.flush();
         mySerial.flush();
         
+        // Reconfigura a Serial hardware
         Serial.begin(baud);
-        Serial.setRxBufferSize(256);
+        Serial.setRxBufferSize(4096);
         
+        // Reconfigura a Serial por Software
+        mySerial.end();  // Desativa antes de reconfigurar
+        digitalWrite(TX_PIN, LOW);  // Garante nível baixo
+        delay(10);
         mySerial.begin(baud);
+        serialActive = true;
         
         String response = "Baudrate alterado para " + String(baud);
         webSocket.broadcastTXT(response);
