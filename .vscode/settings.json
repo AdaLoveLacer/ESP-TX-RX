@@ -1,0 +1,7 @@
+{
+    "idf.espIdfPathWin": "f:\\esp-idf\\v5.5\\esp-idf",
+    "idf.toolsPathWin": "f:\\esp-idf\\.espressif",
+    "idf.pythonInstallPath": "f:\\esp-idf\\.espressif\\tools\\idf-python\\3.11.2\\python.exe",
+    "idf.portWin": "COM4",
+    "C_Cpp.default.compilerPath": ""
+}

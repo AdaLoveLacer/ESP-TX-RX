@@ -1,0 +1,59 @@
+4. PIN DESCRIPTION
+Pin
+Função
+Observação
+1
+CS#
+Chip Select, ativo baixo, lógica digital
+2
+SIO0
+Data Line 0 (Bidirectional), lógica digital
+3
+SIO1
+Data Line 1, lógica digital
+4
+SIO2/WP#
+Data Line 2 ou Write Protect#, ativo baixo, lógica digital
+5
+SIO3/HOLD#
+Data Line 3 ou Hold#, ativo baixo, lógica digital
+6
+VSS
+Ground
+7
+VCC
+Power Supply, 2.65V – 3.6V
+
+Observações:
+
+Pull-up Interno: Os pinos SIO0, SIO1, WP#, e HOLD# possuem resistores de pull-up internos.
+XIP (eXecute-In-Place): O MX25L6433 suporta o modo XIP para execução direta no dispositivo de armazenamento.
+Protocolos de Comunicação
+a. Sequência Básica de Comando (Command Sequence)
+CS# Ativo Baixo: Inicia a comunicação com o flash memory.
+Envio do Código de Comando: O host envia um byte para indicar qual operação deseja realizar.
+Dados e Parâmetros: Dependendo do comando, o host pode enviar dados ou parâmetros adicionais.
+CS# Inativo Alto: Termina a comunicação.
+b. Formato de Comando (Command Format)
+Os comandos são enviados em formato serial, utilizando 8 bits.
+O primeiro byte enviado é sempre o código do comando.
+c. Tipos de Comandos (Command Types)
+Comandos de Leitura:
+Exemplo: READ DATA (03h), Fast Read (0Bh), etc.
+Comandos de Escrita:
+Exemplo: WRITE ENABLE (06h), Page Program (12h), etc.
+Comandos de Apagamento:
+Exemplo: Sector Erase (D8h), Block Erase 32KB (52h), Block Erase 64KB (DCh), Chip Erase (C7h, 60h/9Fh)
+Comandos de Status:
+Exemplo: READ STATUS REGISTER (05h), WRITE STATUS REGISTER (01h), etc.
+d. Protocolo de Comunicação Serial SPI (Serial Peripheral Interface)
+O MX25L6433 suporta o protocolo SPI, que é um interface serial síncrona com três linhas: Clock (SCLK), MISO (Master In Slave Out – Data Line 0), MOSI (Master Out Slave In – Data Line 1).
+
+e. Protocolo de Comunicação XIP (eXecute-In-Place)
+O modo XIP permite que o microcontrolador execute instruções diretamente do MX25L6433, sem a necessidade de transferir dados para a memória RAM primeiro. Os pinos SIO0 e SIO1 são usados para a comunicação de dados durante a execução.
+
+Resumo
+O MX25L6433 tem uma interface com cinco pinos lógicos: CS#, SIO0, SIO1, SIO2/WP#, e SIO3/HOLD#.
+Os comandos são enviados em sequência, com o código de comando seguido de dados ou parâmetros conforme necessário.
+O flash memory suporta protocolos SPI para comunicação e XIP para execução direta do código no dispositivo.
+Espero que essas informações sejam úteis! Se tiver mais perguntas, sinta-se à vontade para perguntar.
