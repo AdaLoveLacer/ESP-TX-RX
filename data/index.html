@@ -1,10 +1,12 @@
 <!DOCTYPE HTML>
 <html>
 <head>
-    <title>ESP8266 Terminal</title>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <title>ESP8266 Serial Bridge</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Language" content="pt-BR">
     <style>
-        /* seu CSS inteiro aqui (mantido igual) */
         body { 
             font-family: Arial; 
             margin: 0; 
@@ -17,8 +19,21 @@
             gap: 20px;
             height: 400px;
         }
-        .terminal-container {
+        .terminals-container {
+            display: flex;
+            gap: 20px;
             flex: 2;
+        }
+        .terminal-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        .terminal-header {
+            background: #333;
+            padding: 5px 10px;
+            border-radius: 5px 5px 0 0;
+            margin-bottom: 5px;
         }
         .history-container {
             flex: 1;
@@ -69,7 +84,7 @@
             font-size: 0.8em;
             margin-right: 5px;
         }
-        #terminal { 
+        .terminal { 
             background: #000; 
             padding: 10px; 
             height: 400px; 
@@ -145,12 +160,26 @@
             border-radius: 3px;
             cursor: pointer;
             font-size: 0.9em;
+            margin-right: 5px;
         }
         .baudrate-select:hover {
             background: #555;
         }
         .baudrate-select option {
             background: #333;
+        }
+        #customBaudrate {
+            width: 100px;
+            background: #444;
+            color: #fff;
+            border: 1px solid #555;
+            border-radius: 3px;
+            padding: 4px 8px;
+            font-size: 0.9em;
+        }
+        #customBaudrate:focus {
+            outline: none;
+            border-color: #0066cc;
         }
         .view-controls {
             display: flex;
@@ -213,7 +242,19 @@
                 <option value="38400">38400 baud</option>
                 <option value="57600">57600 baud</option>
                 <option value="115200">115200 baud</option>
+                <option value="230400">230400 baud</option>
+                <option value="460800">460800 baud</option>
+                <option value="921600">921600 baud</option>
+                <option value="custom">Personalizado...</option>
             </select>
+            <input type="number" id="customBaudrate" style="display: none;" class="baudrate-select" min="1200" max="2000000" step="1200" placeholder="Baudrate...">
+            <select id="lineEnding" onchange="changeLineEnding()" class="baudrate-select">
+                <option value="CRLF" selected>CR+LF (\r\n)</option>
+                <option value="CR">CR (\r)</option>
+                <option value="LF">LF (\n)</option>
+                <option value="NONE">Nenhum</option>
+            </select>
+            <input type="number" id="bufferTimeout" value="50" min="10" max="500" step="10" onchange="changeBufferTimeout()" class="baudrate-select" style="width: 80px;" title="Buffer Timeout (ms)">
             <div class="view-controls">
                 <button onclick="toggleHexView()" class="control-button" id="hexButton">HEX</button>
                 <button onclick="toggleAutoscroll()" class="control-button" id="scrollButton">Auto-scroll</button>
@@ -238,11 +279,26 @@
         </div>
     </div>
     <div class="main-container">
-        <div class="terminal-container">
-            <div id="terminal"></div>
-            <div class="input-area">
-                <input type="text" id="commandInput" placeholder="Digite um comando...">
-                <button onclick="sendCommand()">Enviar</button>
+        <div class="terminals-container">
+            <div class="terminal-container">
+                <div class="terminal-header">Terminal de Envio</div>
+                <div id="terminal" class="terminal"></div>
+                <div class="input-area">
+                    <input type="text" id="commandInput" placeholder="Digite um comando...">
+                    <button onclick="sendCommand()">Enviar</button>
+                </div>
+            </div>
+            <div class="terminal-container">
+                <div class="terminal-header">Terminal de Retorno</div>
+                <div id="terminalEcho" class="terminal"></div>
+            </div>
+            <div class="terminal-container">
+                <div class="terminal-header">Keep Alive & Logs</div>
+                <div id="terminalKeepAlive" class="terminal"></div>
+                <div class="input-area">
+                    <input type="number" id="keepAliveInterval" value="1000" min="500" max="2000" step="500" class="baudrate-select" style="width: 100px;" title="Intervalo Keep Alive (ms)">
+                    <button onclick="changeKeepAliveInterval()" class="control-button">Atualizar</button>
+                </div>
             </div>
         </div>
         <div class="history-container">
@@ -258,6 +314,9 @@
         var websocket;
         var reconnectInterval = null;
         var historyData = [];
+        var lastPingTime = 0;
+        var keepAliveTimer = null;
+        var keepAliveCheckTimer = null;
         
         const CONFIG = {
             maxHistorySize: 100,
@@ -266,6 +325,8 @@
             maxTerminalMessages: 1000,
             reconnectDelay: 2000,
             statsUpdateInterval: 1000,
+            keepAliveInterval: 1000,
+            keepAliveTimeout: 5000
         };
 
         const state = {
@@ -279,13 +340,116 @@
             totalBytesReceived: 0
         };
         
+        function addToSendTerminal(message, type) {
+            const line = createTerminalLine(message, type);
+            const fragment = document.createDocumentFragment();
+            fragment.appendChild(line);
+            domElements.terminal.appendChild(fragment);
+            
+            if (state.autoScroll) {
+                domElements.terminal.scrollTop = domElements.terminal.scrollHeight;
+            }
+            
+            while (domElements.terminal.children.length > CONFIG.maxTerminalMessages) {
+                domElements.terminal.removeChild(domElements.terminal.firstChild);
+            }
+        }
+
         function changeBaudRate() {
-            const baudrate = document.getElementById('baudrate').value;
-            if (websocket.readyState === WebSocket.OPEN) {
-                websocket.send(`@BAUD=${baudrate}`);
-                addToTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
+            const baudrateSelect = document.getElementById('baudrate');
+            const customBaudrateInput = document.getElementById('customBaudrate');
+            
+            if (baudrateSelect.value === 'custom') {
+                customBaudrateInput.style.display = 'inline-block';
+                customBaudrateInput.focus();
+                return;
             } else {
-                addToTerminal('Erro: Não foi possível alterar o baudrate. Conexão fechada.', 'system');
+                customBaudrateInput.style.display = 'none';
+            }
+            
+            const baudrate = baudrateSelect.value;
+            // Armazena a configuração localmente
+            localStorage.setItem('lastBaudrate', baudrate);
+            
+            // Tenta enviar se houver conexão
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send(`@BAUD=${baudrate}`);
+            }
+            
+            addToSendTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
+        }
+
+        // Função para lidar com baudrate personalizado
+        document.addEventListener('DOMContentLoaded', function() {
+            const customBaudrateInput = document.getElementById('customBaudrate');
+            customBaudrateInput.addEventListener('change', function() {
+                const baudrate = this.value;
+                if (baudrate >= 1200 && baudrate <= 2000000) {
+                    // Armazena a configuração localmente
+                    localStorage.setItem('lastBaudrate', baudrate);
+                    
+                    // Tenta enviar se houver conexão
+                    if (websocket && websocket.readyState === WebSocket.OPEN) {
+                        websocket.send(`@BAUD=${baudrate}`);
+                    }
+                    addToSendTerminal(`Alterando baudrate para ${baudrate}...`, 'system');
+                } else {
+                    addToSendTerminal('Baudrate inválido. Use valores entre 1200 e 2000000', 'system');
+                }
+            });
+        });
+
+        function changeLineEnding() {
+            const ending = document.getElementById('lineEnding').value;
+            websocket.send(`@ENDING=${ending}`);
+            addToTerminal(`Final de linha alterado para ${ending}`, 'system');
+        }
+
+        function changeBufferTimeout() {
+            const timeout = document.getElementById('bufferTimeout').value;
+            websocket.send(`@TIMEOUT=${timeout}`);
+            addToSendTerminal(`Timeout do buffer alterado para ${timeout}ms`, 'system');
+        }
+
+        function changeKeepAliveInterval() {
+            const interval = parseInt(document.getElementById('keepAliveInterval').value);
+            if (interval >= 500 && interval <= 2000) {
+                CONFIG.keepAliveInterval = interval;
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    websocket.send(`@KEEP_ALIVE_INTERVAL=${interval}`);
+                    startKeepAlive();
+                }
+                addToTerminal(`Intervalo Keep Alive alterado para ${interval}ms`, 'system');
+            } else {
+                addToTerminal('Intervalo inválido. Use valores entre 500 e 2000ms', 'system');
+            }
+        }
+
+        function startKeepAlive() {
+            stopKeepAlive();
+            keepAliveTimer = setInterval(() => {
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    lastPingTime = Date.now();
+                    websocket.send('@PING');
+                }
+            }, CONFIG.keepAliveInterval);
+            
+            keepAliveCheckTimer = setInterval(() => {
+                if (lastPingTime > 0 && (Date.now() - lastPingTime) > CONFIG.keepAliveTimeout) {
+                    console.log('Keep-Alive timeout - Reconectando...');
+                    websocket.close();
+                }
+            }, CONFIG.keepAliveInterval);
+        }
+
+        function stopKeepAlive() {
+            if (keepAliveTimer) {
+                clearInterval(keepAliveTimer);
+                keepAliveTimer = null;
+            }
+            if (keepAliveCheckTimer) {
+                clearInterval(keepAliveCheckTimer);
+                keepAliveCheckTimer = null;
             }
         }
 
@@ -295,6 +459,19 @@
             initDOMCache();
             initWebSocket();
             startStatistics();
+            
+            // Carrega o último baud rate salvo
+            const lastBaudrate = localStorage.getItem('lastBaudrate');
+            if (lastBaudrate) {
+                const baudrateSelect = document.getElementById('baudrate');
+                if (Array.from(baudrateSelect.options).some(opt => opt.value === lastBaudrate)) {
+                    baudrateSelect.value = lastBaudrate;
+                } else {
+                    baudrateSelect.value = 'custom';
+                    document.getElementById('customBaudrate').value = lastBaudrate;
+                    document.getElementById('customBaudrate').style.display = 'inline-block';
+                }
+            }
             
             document.getElementById('commandInput').addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
@@ -325,28 +502,90 @@
         function onOpen(event) {
             console.log('Conexão estabelecida');
             updateConnectionStatus(true);
-            addToTerminal('Sistema conectado!', 'system');
-            const baudrate = document.getElementById('baudrate').value;
-            setTimeout(() => {
-                websocket.send(`@BAUD=${baudrate}`);
-            }, 1000);
             if (reconnectInterval) {
                 clearInterval(reconnectInterval);
                 reconnectInterval = null;
             }
+            startKeepAlive();
         }
 
         function onClose(event) {
             console.log('Conexão fechada');
             updateConnectionStatus(false);
-            addToTerminal('Conexão perdida. Tentando reconectar...', 'system');
+            stopKeepAlive();
             if (!reconnectInterval) {
-                reconnectInterval = setInterval(initWebSocket, 2000);
+                reconnectInterval = setInterval(initWebSocket, CONFIG.reconnectDelay);
+            }
+        }
+
+        function handleConfig(message) {
+            const [cmd, value] = message.split('=');
+            switch(cmd) {
+                case '@CONFIG:BAUD':
+                    document.getElementById('baudrate').value = value;
+                    if (!document.getElementById('baudrate').value) {
+                        document.getElementById('baudrate').value = 'custom';
+                        document.getElementById('customBaudrate').value = value;
+                        document.getElementById('customBaudrate').style.display = 'inline-block';
+                    }
+                    break;
+                case '@CONFIG:ENDING':
+                    document.getElementById('lineEnding').value = value;
+                    break;
+                case '@CONFIG:TIMEOUT':
+                    document.getElementById('bufferTimeout').value = value;
+                    break;
+                case '@CONFIG:KEEPALIVE':
+                    const keepAliveValue = parseInt(value);
+                    if (keepAliveValue >= 500 && keepAliveValue <= 2000) {
+                        document.getElementById('keepAliveInterval').value = keepAliveValue;
+                        CONFIG.keepAliveInterval = keepAliveValue;
+                        startKeepAlive();
+                    }
+                    break;
             }
         }
 
         function onMessage(event) {
-            addToTerminal(event.data, 'received');
+            // Verifica se é uma mensagem de configuração
+            if (event.data.startsWith('@CONFIG:')) {
+                handleConfig(event.data);
+                return;
+            }
+            
+            // Verifica se é uma mensagem de keep-alive
+            if (event.data.startsWith('@PONG:')) {
+                const timestamp = parseInt(event.data.split(':')[1]);
+                const latency = Date.now() - timestamp;
+                const line = createTerminalLine(`Keep-Alive Latência: ${latency}ms`, 'system');
+            const fragment = document.createDocumentFragment();
+            fragment.appendChild(line);
+            domElements.terminalKeepAlive.appendChild(fragment);
+            if (state.autoScroll) {
+                domElements.terminalKeepAlive.scrollTop = domElements.terminalKeepAlive.scrollHeight;
+            }
+                return;
+            }
+            
+            // Atualiza estatísticas
+            updateStats(event.data);
+            
+            // Adiciona ao terminal de eco (retorno)
+            const line = createTerminalLine(event.data, 'received');
+            const fragment = document.createDocumentFragment();
+            fragment.appendChild(line);
+            domElements.terminalEcho.appendChild(fragment);
+            
+            // Auto-scroll para o terminal de eco
+            if (state.autoScroll) {
+                domElements.terminalEcho.scrollTop = domElements.terminalEcho.scrollHeight;
+            }
+            
+            // Limita o número de mensagens no terminal de eco
+            while (domElements.terminalEcho.children.length > CONFIG.maxTerminalMessages) {
+                domElements.terminalEcho.removeChild(domElements.terminalEcho.firstChild);
+            }
+            
             addToHistory(event.data);
         }
 
@@ -386,18 +625,35 @@
         function sendCommand() {
             var cmd = document.getElementById('commandInput').value;
             if (cmd) {
-                if (websocket.readyState === WebSocket.OPEN) {
+                // Permite enviar comandos independente do estado da conexão
+                try {
                     websocket.send(cmd);
-                    addToTerminal('> ' + cmd, 'sent');
-                    document.getElementById('commandInput').value = '';
-                } else {
-                    addToTerminal('Erro: Não foi possível enviar o comando. Conexão fechada.', 'system');
+                    const line = createTerminalLine('> ' + cmd, 'sent');
+                    const fragment = document.createDocumentFragment();
+                    fragment.appendChild(line);
+                    domElements.terminal.appendChild(fragment);
+                    
+                    if (state.autoScroll) {
+                        domElements.terminal.scrollTop = domElements.terminal.scrollHeight;
+                    }
+                    
+                    while (domElements.terminal.children.length > CONFIG.maxTerminalMessages) {
+                        domElements.terminal.removeChild(domElements.terminal.firstChild);
+                    }
+                } catch (e) {
+                    const line = createTerminalLine('Erro ao enviar comando: ' + e, 'system');
+                    const fragment = document.createDocumentFragment();
+                    fragment.appendChild(line);
+                    domElements.terminal.appendChild(fragment);
                 }
+                document.getElementById('commandInput').value = '';
             }
         }
 
         const domElements = {
             terminal: null,
+            terminalEcho: null,
+            terminalKeepAlive: null,
             bytesReceived: null,
             lastMessageTime: null,
             messagesPerSecond: null,
@@ -407,6 +663,8 @@
 
         function initDOMCache() {
             domElements.terminal = document.getElementById('terminal');
+            domElements.terminalEcho = document.getElementById('terminalEcho');
+            domElements.terminalKeepAlive = document.getElementById('terminalKeepAlive');
             domElements.bytesReceived = document.getElementById('bytesReceived');
             domElements.lastMessageTime = document.getElementById('lastMessageTime');
             domElements.messagesPerSecond = document.getElementById('messagesPerSecond');
@@ -425,14 +683,23 @@
             state.isHexView = !state.isHexView;
             document.getElementById('hexButton').classList.toggle('active');
             
-            const fragment = document.createDocumentFragment();
+            // Atualiza terminal de envio
+            const fragmentSend = document.createDocumentFragment();
             Array.from(domElements.terminal.children).forEach(msg => {
                 const newLine = createTerminalLine(msg.textContent, msg.className);
-                fragment.appendChild(newLine);
+                fragmentSend.appendChild(newLine);
             });
-            
             domElements.terminal.innerHTML = '';
-            domElements.terminal.appendChild(fragment);
+            domElements.terminal.appendChild(fragmentSend);
+            
+            // Atualiza terminal de retorno
+            const fragmentEcho = document.createDocumentFragment();
+            Array.from(domElements.terminalEcho.children).forEach(msg => {
+                const newLine = createTerminalLine(msg.textContent, msg.className);
+                fragmentEcho.appendChild(newLine);
+            });
+            domElements.terminalEcho.innerHTML = '';
+            domElements.terminalEcho.appendChild(fragmentEcho);
         }
 
         function toggleAutoscroll() {
@@ -463,7 +730,7 @@
 
         function startFirmwareDump() {
             if (isDumping) {
-                addToTerminal('Dump já em andamento...', 'system');
+                addToSendTerminal('Dump já em andamento...', 'system');
                 return;
             }
 
@@ -474,7 +741,7 @@
             dumpStartAddress = 0;
             totalBytesReceived = 0;
 
-            addToTerminal('Iniciando dump do firmware...', 'system');
+            addToSendTerminal('Iniciando dump do firmware...', 'system');
             requestNextChunk();
         }
 
@@ -565,34 +832,14 @@
             return line;
         }
 
-        function addToTerminal(message, type) {
+        function updateStats(message) {
             state.bytesReceived += message.length;
             state.totalBytesReceived += message.length;
             state.lastMessageTime = new Date();
-            
-            if (type === 'received') {
-                state.messagesLastSecond++;
-                
-                domElements.bytesReceived.textContent = state.bytesReceived;
-                domElements.lastMessageTime.textContent = state.lastMessageTime.toLocaleTimeString();
-            }
-
-            const line = createTerminalLine(message, type);
-            
-            const fragment = document.createDocumentFragment();
-            fragment.appendChild(line);
-            
-            domElements.terminal.appendChild(fragment);
-            
-            if (state.autoScroll) {
-                domElements.terminal.scrollTop = domElements.terminal.scrollHeight;
-            }
-
-            while (domElements.terminal.children.length > CONFIG.maxTerminalMessages) {
-                domElements.terminal.removeChild(domElements.terminal.firstChild);
-            }
+            state.messagesLastSecond++;
+            domElements.bytesReceived.textContent = state.bytesReceived;
+            domElements.lastMessageTime.textContent = state.lastMessageTime.toLocaleTimeString();
         }
     </script>
 </body>
 </html>
-)rawliteral";

@@ -2,6 +2,13 @@
 #include <WebSocketsServer.h>
 #include <ESP8266WebServer.h>
 #include <SoftwareSerial.h>
+#include <EEPROM.h>
+#include <string.h>
+
+// Declarações globais
+String lineEnding = "\r\n"; // Final de linha padrão
+int serialReadTimeout = 1; // ms (tempo mínimo entre leituras)
+int mySerialReadTimeout = 1; // ms
 
 // STA (rede do roteador) - altere para sua rede
 const char* sta_ssid = "Morpheus-Base";
@@ -19,7 +26,7 @@ const char* ap_password = "12345678";
 SoftwareSerial mySerial(RX_PIN, TX_PIN, false);  // RX, TX, inverse_logic
 
 // Baudrate inicial
-long baud = 9600;
+long baud = 115200;
 
 // Flags de controle
 bool serialActive = false;
@@ -27,14 +34,72 @@ bool apMode = false;
 int lastWiFiStatus = -1; // para detectar mudanças de estado
 
 // Configurações persistentes
-struct {
-    long baudrate = 9600;
-    String lineEnding = "\r\n";
-    int bufferTimeout = 50;
+struct BridgeConfig {
+    long baudrate;
+    char lineEnding[3];  // Máximo de 2 caracteres + null terminator
+    int bufferTimeout;
+    uint8_t checksum;  // Para validação
 } currentConfig;
 
-// Variáveis de controle
-String lineEnding = "\r\n"; // Padrão CR+LF
+// Funções para salvar e carregar configurações
+void saveConfig() {
+    EEPROM.begin(512); // Garante espaço suficiente
+    currentConfig.checksum = 0;  // Limpa o checksum antes de calcular
+    
+    // Calcula o checksum de todos os campos exceto o próprio checksum
+    uint8_t* configBytes = (uint8_t*)&currentConfig;
+    for(size_t i = 0; i < sizeof(BridgeConfig) - sizeof(uint8_t); i++) {
+        currentConfig.checksum += configBytes[i];
+    }
+    
+    // Escreve a estrutura byte a byte
+    for(size_t i = 0; i < sizeof(BridgeConfig); i++) {
+        EEPROM.write(i, configBytes[i]);
+    }
+    
+    if (!EEPROM.commit()) {
+        Serial.println("ERRO: Falha ao salvar configurações!");
+    }
+    EEPROM.end();
+}
+
+void loadConfig() {
+    EEPROM.begin(512);
+    BridgeConfig savedConfig;
+    uint8_t* configBytes = (uint8_t*)&savedConfig;
+    
+    // Lê a estrutura byte a byte
+    for(size_t i = 0; i < sizeof(BridgeConfig); i++) {
+        configBytes[i] = EEPROM.read(i);
+    }
+    
+    // Calcula e verifica checksum
+    uint8_t calculatedChecksum = 0;
+    for(size_t i = 0; i < sizeof(BridgeConfig) - sizeof(uint8_t); i++) {
+        calculatedChecksum += configBytes[i];
+    }
+    
+    if (calculatedChecksum == savedConfig.checksum) {
+        Serial.println("Checksum válido, carregando configurações salvas");
+        currentConfig = savedConfig;
+        baud = currentConfig.baudrate;
+        lineEnding = String(currentConfig.lineEnding);
+        serialReadTimeout = currentConfig.bufferTimeout;
+        mySerialReadTimeout = currentConfig.bufferTimeout;
+        
+        Serial.print("Baudrate carregado: "); Serial.println(baud);
+        Serial.print("Line ending carregado: "); Serial.println(lineEnding);
+        Serial.print("Buffer timeout carregado: "); Serial.println(serialReadTimeout);
+    } else {
+        Serial.println("Checksum inválido, usando configurações padrão");
+        // Configurações padrão se o checksum for inválido
+        currentConfig.baudrate = 115200;
+        strcpy(currentConfig.lineEnding, "\r\n");
+        currentConfig.bufferTimeout = 50;
+        saveConfig();  // Salva as configurações padrão
+    }
+    EEPROM.end();
+}
 
 // Constantes para o buffer circular
 const int BUFFER_SIZE = 4096;
@@ -47,10 +112,6 @@ int hwSerialHead = 0;
 int hwSerialTail = 0;
 int swSerialHead = 0;
 int swSerialTail = 0;
-
-// Timeouts
-int serialReadTimeout = 1; // ms (tempo mínimo entre leituras)
-int mySerialReadTimeout = 1; // ms
 
 // Timestamps para controle
 unsigned long lastSerialRead = 0;
@@ -67,11 +128,10 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
 <head>
     <meta charset="UTF-8">
     <meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
-    <title>ESP8266 Terminal</title>
+    <title>ESP8266 Serial Bridge</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Content-Language" content="pt-BR">
     <style>
-        /* seu CSS inteiro aqui (mantido igual) */
         body { 
             font-family: Arial; 
             margin: 0; 
@@ -302,11 +362,11 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                 <option value="1200">1200 baud</option>
                 <option value="2400">2400 baud</option>
                 <option value="4800">4800 baud</option>
-                <option value="9600" selected>9600 baud</option>
+                <option value="9600">9600 baud</option>
                 <option value="19200">19200 baud</option>
                 <option value="38400">38400 baud</option>
                 <option value="57600">57600 baud</option>
-                <option value="115200">115200 baud</option>
+                <option value="115200" selected>115200 baud</option>
                 <option value="230400">230400 baud</option>
                 <option value="460800">460800 baud</option>
                 <option value="921600">921600 baud</option>
@@ -357,6 +417,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                 <div class="terminal-header">Terminal de Retorno</div>
                 <div id="terminalEcho" class="terminal"></div>
             </div>
+
         </div>
         <div class="history-container">
             <div class="history-header">
@@ -371,14 +432,13 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         var websocket;
         var reconnectInterval = null;
         var historyData = [];
-        
         const CONFIG = {
             maxHistorySize: 100,
             maxMessageSize: 1024 * 1024,
             dumpChunkSize: 256,
             maxTerminalMessages: 1000,
             reconnectDelay: 2000,
-            statsUpdateInterval: 1000,
+            statsUpdateInterval: 1000
         };
 
         const state = {
@@ -454,7 +514,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         function changeLineEnding() {
             const ending = document.getElementById('lineEnding').value;
             websocket.send(`@ENDING=${ending}`);
-            addToTerminal(`Final de linha alterado para ${ending}`, 'system');
+            addToSendTerminal(`Final de linha alterado para ${ending}`, 'system');
         }
 
         function changeBufferTimeout() {
@@ -462,6 +522,8 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             websocket.send(`@TIMEOUT=${timeout}`);
             addToSendTerminal(`Timeout do buffer alterado para ${timeout}ms`, 'system');
         }
+
+
 
         window.addEventListener('load', onLoad);
 
@@ -522,7 +584,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             console.log('Conexão fechada');
             updateConnectionStatus(false);
             if (!reconnectInterval) {
-                reconnectInterval = setInterval(initWebSocket, 2000);
+                reconnectInterval = setInterval(initWebSocket, CONFIG.reconnectDelay);
             }
         }
 
@@ -543,6 +605,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                 case '@CONFIG:TIMEOUT':
                     document.getElementById('bufferTimeout').value = value;
                     break;
+
             }
         }
 
@@ -551,6 +614,13 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             if (event.data.startsWith('@CONFIG:')) {
                 handleConfig(event.data);
                 return;
+            }
+            
+            // Verifica se é uma resposta de dump
+            if (event.data.startsWith('@DUMP:')) {
+                if (processDumpResponse(event.data)) {
+                    return;
+                }
             }
             
             // Atualiza estatísticas
@@ -649,6 +719,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         function initDOMCache() {
             domElements.terminal = document.getElementById('terminal');
             domElements.terminalEcho = document.getElementById('terminalEcho');
+
             domElements.bytesReceived = document.getElementById('bytesReceived');
             domElements.lastMessageTime = document.getElementById('lastMessageTime');
             domElements.messagesPerSecond = document.getElementById('messagesPerSecond');
@@ -733,7 +804,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             if (!isDumping) return;
             
             websocket.send(`@DUMP=${dumpStartAddress.toString(16)},${CONFIG.dumpChunkSize}`);
-            addToTerminal(`Solicitando chunk de memória: 0x${dumpStartAddress.toString(16)}`, 'system');
+            addToSendTerminal(`Solicitando chunk de memória: 0x${dumpStartAddress.toString(16)}`, 'system');
         }
 
         function processDumpResponse(data) {
@@ -750,7 +821,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             firmwareChunks.push(bytes);
             totalBytesReceived += bytes.length;
 
-            addToTerminal(`Recebido chunk de 0x${addr.toString(16)} (${bytes.length} bytes)`, 'system');
+            addToSendTerminal(`Recebido chunk de 0x${addr.toString(16)} (${bytes.length} bytes)`, 'system');
 
             if (bytes.length === 0 || totalBytesReceived >= 1024*1024) {
                 finishDump();
@@ -784,7 +855,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             window.URL.revokeObjectURL(url);
             document.body.removeChild(a);
 
-            addToTerminal(`Dump completo! Total de ${totalBytesReceived} bytes salvos.`, 'system');
+            addToSendTerminal(`Dump completo! Total de ${totalBytesReceived} bytes salvos.`, 'system');
         }
 
         function toHex(str) {
@@ -876,9 +947,22 @@ void connectToWiFiOrAP(unsigned long timeout_ms = 10000) {
 }
 
 void setup() {
+  // Inicializa Serial para debug
+  Serial.begin(115200);
+  Serial.println("\n\nIniciando ESP8266 Serial Bridge...");
+  
+  // Carrega configurações salvas
+  Serial.println("Carregando configurações...");
+  loadConfig();
+  
+  Serial.println("Configurações atuais:");
+  Serial.print("Baudrate: "); Serial.println(currentConfig.baudrate);
+  Serial.print("Line ending: "); Serial.println(currentConfig.lineEnding);
+  Serial.print("Buffer timeout: "); Serial.println(currentConfig.bufferTimeout);
+  
   // Configuração dos pinos
   pinMode(TX_PIN, OUTPUT);
-  pinMode(RX_PIN, INPUT);
+  pinMode(RX_PIN, INPUT_PULLUP);
   
   // Pull-down via software no TX
   digitalWrite(TX_PIN, LOW);
@@ -888,7 +972,7 @@ void setup() {
   // Inicializa Serial com buffer maior e parâmetros específicos
   Serial.begin(115200, SERIAL_8N1);
   Serial.setRxBufferSize(4096);
-  Serial.setTimeout(1);
+  Serial.setTimeout(4);
   Serial.flush();
   delay(100);
   Serial.println("Debug serial OK");
@@ -1055,9 +1139,9 @@ void sendCurrentConfig(uint8_t clientNum) {
     
     // Envia configuração de line ending
     String endingConfig = "@CONFIG:ENDING=";
-    if (currentConfig.lineEnding == "\r\n") endingConfig += "CRLF";
-    else if (currentConfig.lineEnding == "\r") endingConfig += "CR";
-    else if (currentConfig.lineEnding == "\n") endingConfig += "LF";
+    if (strcmp(currentConfig.lineEnding, "\r\n") == 0) endingConfig += "CRLF";
+    else if (strcmp(currentConfig.lineEnding, "\r") == 0) endingConfig += "CR";
+    else if (strcmp(currentConfig.lineEnding, "\n") == 0) endingConfig += "LF";
     else endingConfig += "NONE";
     webSocket.sendTXT(clientNum, endingConfig);
     
@@ -1096,6 +1180,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         mySerial.begin(baud);
         serialActive = true;
         
+        // Salva a configuração
+        saveConfig();
+        
         String response = "Baudrate alterado para " + String(baud);
         webSocket.broadcastTXT(response);
       }
@@ -1103,11 +1190,15 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     // Muda final de linha
     else if (msg.startsWith("@ENDING=")) {
       String newEnding = msg.substring(8);
-      if (newEnding == "CRLF") currentConfig.lineEnding = "\r\n";
-      else if (newEnding == "CR") currentConfig.lineEnding = "\r";
-      else if (newEnding == "LF") currentConfig.lineEnding = "\n";
-      else if (newEnding == "NONE") currentConfig.lineEnding = "";
-      lineEnding = currentConfig.lineEnding;
+      if (newEnding == "CRLF") strcpy(currentConfig.lineEnding, "\r\n");
+      else if (newEnding == "CR") strcpy(currentConfig.lineEnding, "\r");
+      else if (newEnding == "LF") strcpy(currentConfig.lineEnding, "\n");
+      else if (newEnding == "NONE") strcpy(currentConfig.lineEnding, "");
+      lineEnding = String(currentConfig.lineEnding);
+      
+      // Salva a configuração
+      saveConfig();
+      
       String response = "Final de linha alterado para: " + newEnding;
       webSocket.sendTXT(num, response);
     }
@@ -1118,6 +1209,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         currentConfig.bufferTimeout = newTimeout;
         serialReadTimeout = newTimeout;
         mySerialReadTimeout = newTimeout;
+        
+        // Salva a configuração
+        saveConfig();
+        
         String response = "Timeout do buffer alterado para: " + String(newTimeout) + "ms";
         webSocket.sendTXT(num, response);
       }
@@ -1140,11 +1235,15 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     }
     // Comando normal: envia para ambas UARTs
     else {
-      sendFormattedData(msg, "WEB->USB");  // Indica que o comando veio da web para a USB
-      Serial.print(msg + lineEnding);
-      
-      sendFormattedData(msg, "WEB->TX/RX");  // Indica que o comando veio da web para TX/RX
-      mySerial.print(msg + lineEnding);
+        sendFormattedData(msg, "WEB->USB");  // Indica que o comando veio da web para a USB
+        Serial.print(msg);
+        Serial.print(lineEnding);
+        Serial.flush();
+
+        sendFormattedData(msg, "WEB->TX/RX");  // Indica que o comando veio da web para TX/RX
+        mySerial.print(msg);
+        mySerial.print(lineEnding);
+        mySerial.flush();
     }
   }
 }
